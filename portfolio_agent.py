@@ -33,10 +33,10 @@ from email.mime.multipart import MIMEMultipart
 # ============================================================
 import os
 
-TELEGRAM_TOKEN    = os.environ.get("8516185511",    "8833949026:AAG_O3abIz08W_l714iV8FHPX8UjcD60aOs")
-TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID",  "PASTE_CHAT_ID_HERE")
-GMAIL_ADDRESS     = os.environ.get("kiratpalsingh93@gmail.com",     "PASTE_YOUR_GMAIL_HERE")
-GMAIL_APP_PASS    = os.environ.get("isaj gcvv avmm rdib",    "PASTE_APP_PASSWORD_HERE")
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN",    "8833949026:AAG_O3abIz08W_l714iV8FHPX8UjcD60aOs")
+TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID",  "8516185511")
+GMAIL_ADDRESS     = os.environ.get("GMAIL_ADDRESS",     "kiratpalsingh93@gmail.com")
+GMAIL_APP_PASS    = os.environ.get("GMAIL_APP_PASS",    "isaj gcvv avmm rdib")
 
 EMAIL_TO = [
     "kiratpalsingh93@gmail.com",
