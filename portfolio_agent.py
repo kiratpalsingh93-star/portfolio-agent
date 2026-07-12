@@ -33,10 +33,10 @@ from email.mime.multipart import MIMEMultipart
 # ============================================================
 import os
 
-TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN",    "8833949026:AAG_O3abIz08W_l714iV8FHPX8UjcD60aOs")
+TELEGRAM_TOKEN    = os.environ.get("8516185511",    "8833949026:AAG_O3abIz08W_l714iV8FHPX8UjcD60aOs")
 TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID",  "PASTE_CHAT_ID_HERE")
-GMAIL_ADDRESS     = os.environ.get("GMAIL_ADDRESS",     "PASTE_YOUR_GMAIL_HERE")
-GMAIL_APP_PASS    = os.environ.get("GMAIL_APP_PASS",    "PASTE_APP_PASSWORD_HERE")
+GMAIL_ADDRESS     = os.environ.get("kiratpalsingh93@gmail.com",     "PASTE_YOUR_GMAIL_HERE")
+GMAIL_APP_PASS    = os.environ.get("isaj gcvv avmm rdib",    "PASTE_APP_PASSWORD_HERE")
 
 EMAIL_TO = [
     "kiratpalsingh93@gmail.com",
@@ -606,7 +606,7 @@ def build_email_html(results, news_items):
 # ============================================================
 
 def send_telegram(text):
-    url    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url    = f"https://api.telegram.org/bot{8516185511}/sendMessage"
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
     for chunk in chunks:
         r = requests.post(url, json={
@@ -624,17 +624,17 @@ def send_telegram(text):
 def send_email(html_body, subject):
     msg            = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"]    = GMAIL_ADDRESS
-    msg["To"]      = ", ".join(EMAIL_TO)
+    msg["From"]    = kiratpalsingh93@gmail.com
+    msg["To"]      = ", ".join(kiratpalsingh93@gmail.com)
     msg.attach(MIMEText(html_body, "html"))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
-        s.login(GMAIL_ADDRESS, GMAIL_APP_PASS)
-        s.sendmail(GMAIL_ADDRESS, EMAIL_TO, msg.as_string())
-    print(f"  ✅ Email sent → {', '.join(EMAIL_TO)}")
+        s.login(kiratpalsingh93@gmail.com, isaj gcvv avmm rdib)
+        s.sendmail(kiratpalsingh93@gmail.com, kiratpalsingh93@gmail.com, msg.as_string())
+    print(f"  ✅ Email sent → {', '.join(kiratpalsingh93@gmail.com)}")
 
 
 def get_chat_id():
-    url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    url  = f"https://api.telegram.org/bot{8516185511}/getUpdates"
     data = requests.get(url, timeout=10).json()
     recs = data.get("result", [])
     if not recs:
