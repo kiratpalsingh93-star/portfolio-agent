@@ -1,0 +1,822 @@
+#!/usr/bin/env python3
+"""
+Portfolio Daily Digest Agent v3
+Changes vs v2:
+  - Quantities added to every stock; invested = qty x avg_buy
+  - Stocks sorted by invested amount descending (Indian and US separately)
+  - Gold ETF and Bitcoin tracked in a dedicated Gold & Bitcoin section
+  - 1W / 1M / 1Y performance added for every stock, Gold, and Bitcoin
+  - Bitcoin extras: 200d MA, RSI, 30d volatility, Fear & Greed index
+  - "Action Needed Today" section removed
+  - Run time changed to 1:00 PM IST (cron 30 7 * * *)
+  - Monthly reminder on 1st of month to upload latest portfolio files
+"""
+
+import sys, os, smtplib, requests
+import yfinance as yf
+import pandas as pd
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+# ============================================================
+# CREDENTIALS  (overridden by GitHub Secrets in production)
+# ============================================================
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "8833949026:AAG_O3abIz08W_l714iV8FHPX8UjcD60aOs")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8516185511")
+GMAIL_ADDRESS    = os.environ.get("GMAIL_ADDRESS",    "kiratpalsingh93@gmail.com")
+GMAIL_APP_PASS   = os.environ.get("GMAIL_APP_PASS",   "isaj gcvv avmm rdib")
+EMAIL_TO = ["kiratpalsingh93@gmail.com", "baldeep.singh.bakshi@gmail.com"]
+
+# ============================================================
+# HOLDINGS
+# (ticker, display_name, qty, avg_buy_price, currency_symbol)
+# Pre-sorted by invested (qty x avg_buy) descending within each group
+# ============================================================
+
+INDIAN = [
+    ("NIFTYADD.NS",   "Nifty ADD ETF",     508,     239.33, "INR"),  # Rs 1,21,579
+    ("ITBEES.NS",     "IT BeES ETF",      1701,      38.08, "INR"),  # Rs 64,787
+    ("KOTAKBANK.NS",  "Kotak Bank",        130,     355.95, "INR"),  # Rs 46,274
+    ("ETERNAL.NS",    "Eternal/Zomato",    197,     197.82, "INR"),  # Rs 38,971
+    ("HINDUNILVR.NS", "HUL",               16,    2307.45, "INR"),  # Rs 36,919
+    ("TITAN.NS",      "Titan",             10,    3296.15, "INR"),  # Rs 32,962
+    ("FIRSTCRY.NS",   "FirstCry",          64,     465.00, "INR"),  # Rs 29,760
+    ("HDFCBANK.NS",   "HDFC Bank",         56,     488.95, "INR"),  # Rs 27,381
+    ("MAXHEALTH.NS",  "Max Healthcare",    18,    1134.77, "INR"),  # Rs 20,426
+    ("IDFCFIRSTB.NS", "IDFC First Bank",  292,      69.84, "INR"),  # Rs 20,393
+    ("ARE&M.NS",      "Amara Raja",        20,     999.55, "INR"),  # Rs 19,991
+    ("SBICARD.NS",    "SBI Card",          25,     750.55, "INR"),  # Rs 18,764
+    ("JIOFIN.NS",     "Jio Financial",     69,     249.57, "INR"),  # Rs 17,220
+    ("FORTIS.NS",     "Fortis Health",     19,     903.72, "INR"),  # Rs 17,171
+    ("GROWW.NS",      "Groww",            150,     100.00, "INR"),  # Rs 15,000
+    ("URBANCO.NS",    "Urban Company",    104,     143.71, "INR"),  # Rs 14,946
+    ("APOLLOHOSP.NS", "Apollo Hosp",        2,    7235.47, "INR"),  # Rs 14,471
+    ("TEJASNET.NS",   "Tejas Networks",    23,     599.93, "INR"),  # Rs 13,799
+    ("PGEL.NS",       "PG Electroplast",   21,     575.00, "INR"),  # Rs 12,075
+    ("NIFTYBEES.NS",  "Nifty BeES",        37,     264.88, "INR"),  # Rs 9,801
+    ("KWIL.NS",       "KWIL",              16,      44.07, "INR"),  # Rs 705
+]
+
+US = [
+    ("SPY",   "S&P 500 ETF",   4.025284,   644.58, "USD"),  # $2,594
+    ("QTEC",  "QTEC ETF",     10.277545,   216.02, "USD"),  # $2,220
+    ("SOXX",  "Semi ETF",      3.719219,   317.70, "USD"),  # $1,182
+    ("MSFT",  "Microsoft",     1.461997,   410.40, "USD"),  # $600
+    ("META",  "Meta",          0.930220,   645.01, "USD"),  # $600
+    ("NOW",   "ServiceNow",    4.457864,   100.95, "USD"),  # $450
+    ("NVDA",  "NVIDIA",        2.029727,   197.07, "USD"),  # $400
+    ("GOOGL", "Alphabet",      1.033840,   314.35, "USD"),  # $325
+    ("AMZN",  "Amazon",        1.407884,   220.19, "USD"),  # $310
+    ("ADBE",  "Adobe",         0.992294,   302.33, "USD"),  # $300
+    ("NVO",   "Novo Nordisk",  4.854342,    51.50, "USD"),  # $250
+    ("NFLX",  "Netflix",       2.020555,    86.61, "USD"),  # $175
+    ("DUOL",  "Duolingo",      0.819982,   182.93, "USD"),  # $150
+    ("CRWD",  "CrowdStrike",   1.458028,   102.88, "USD"),  # $150
+    ("PANW",  "Palo Alto",     0.907616,   165.27, "USD"),  # $150
+    ("UNH",   "UnitedHealth",  0.508220,   295.15, "USD"),  # $150
+    ("LLY",   "Eli Lilly",     0.098583,  1115.81, "USD"),  # $110
+]
+
+# Gold ETF — tracked separately (not in INDIAN list)
+# (ticker, display_name, qty, avg_buy, sym)
+GOLD = ("GOLDIETF.NS", "Gold ETF (HDFC)", 622, 119.94, "INR")
+
+# Bitcoin holding
+BITCOIN = {
+    "qty_btc":      0.00565601,
+    "invested_inr": 42000,       # total rupees invested
+}
+
+# ETFs — skip P/E
+ETF_TICKERS = {
+    "GOLDIETF.NS", "ITBEES.NS", "NIFTYADD.NS", "NIFTYBEES.NS",
+    "QTEC", "SOXX", "SPY",
+}
+
+SECTOR_PE = {
+    "Technology": 28, "Healthcare": 22, "Financial Services": 14,
+    "Consumer Defensive": 28, "Consumer Cyclical": 20,
+    "Communication Services": 18, "Energy": 12, "Industrials": 20,
+    "Basic Materials": 15, "Real Estate": 25, "Utilities": 16,
+}
+
+SYM = {"INR": "₹", "USD": "$"}   # currency symbols
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _pf(price, sym_code):
+    s = SYM.get(sym_code, sym_code)
+    return f"{s}{price:,.0f}" if sym_code == "INR" else f"{s}{price:,.2f}"
+
+def _pct(v, decimals=1):
+    arrow = "▲" if v >= 0 else "▼"
+    return f"{arrow}{abs(v):.{decimals}f}%"
+
+_bench_cache = {}
+
+def _bench_return(symbol, n=63):
+    if symbol in _bench_cache:
+        return _bench_cache[symbol]
+    try:
+        h = yf.Ticker(symbol).history(period="400d")["Close"]
+        n = min(n, len(h) - 1)
+        ret = (float(h.iloc[-1]) - float(h.iloc[-n])) / float(h.iloc[-n]) * 100
+        _bench_cache[symbol] = ret
+        return ret
+    except Exception:
+        _bench_cache[symbol] = None
+        return None
+
+def _calc_rsi(close, period=14):
+    delta = close.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss.replace(0, float("nan"))
+    val   = 100 - 100 / (1 + rs)
+    v     = float(val.iloc[-1])
+    return None if pd.isna(v) else v
+
+def _perf(close, n_days):
+    """Percent change from n_days ago to today."""
+    n = min(n_days, len(close) - 1)
+    if n < 1:
+        return None
+    old = float(close.iloc[-n - 1])
+    cur = float(close.iloc[-1])
+    if old == 0 or pd.isna(old) or pd.isna(cur):
+        return None
+    return (cur - old) / old * 100
+
+def _stage(price, ma50, ma150, ma250, close):
+    if ma50 is None or ma150 is None:
+        return 0
+    def rising(n):
+        s = close.rolling(n).mean()
+        return float(s.iloc[-1]) > float(s.iloc[-21]) if len(s) >= n + 21 else None
+    r50   = rising(50)
+    ab50  = price > ma50
+    ab150 = price > ma150
+    ab250 = (price > ma250) if ma250 is not None else True
+    if ab50 and ab150 and ab250 and r50:        return 2
+    if not ab50 and not ab150 and r50 is False: return 4
+    if ab50 and ab150 and r50 is False:          return 3
+    return 1
+
+def _stage_bg(stage):
+    return {2: "#eaf7ee", 3: "#fff9e6", 4: "#fdecea", 1: "#f8f9fa", 0: "#ffffff"}[stage]
+
+def _action(stage, pct_buy, rsi):
+    if stage == 2:
+        if rsi and rsi > 75:
+            return "Hold (Overbought)"
+        return "Add on Dip" if pct_buy < 0 else "Hold"
+    if stage == 3: return "Trim / Watch"
+    if stage == 4: return "Exit?"
+    return "Watch"
+
+
+# ============================================================
+# STOCK ANALYSIS
+# ============================================================
+
+def analyse(ticker, name, qty, avg_buy, sym, benchmark):
+    try:
+        t    = yf.Ticker(ticker)
+        hist = t.history(period="400d")
+        if hist is None or hist.empty or len(hist) < 52:
+            return {
+                "name": name, "ticker": ticker, "sym": sym,
+                "qty": qty, "avg_buy": avg_buy,
+                "invested": qty * avg_buy, "error": "data unavailable",
+            }
+
+        close  = hist["Close"].dropna()
+        if len(close) < 52:
+            return {
+                "name": name, "ticker": ticker, "sym": sym,
+                "qty": qty, "avg_buy": avg_buy,
+                "invested": qty * avg_buy, "error": "insufficient data after dropna",
+            }
+        price  = float(close.iloc[-1])
+        prev   = float(close.iloc[-2]) if len(close) > 1 else price
+
+        def ma(n):
+            return float(close.rolling(n).mean().iloc[-1]) if len(close) >= n else None
+
+        ma50, ma150, ma250 = ma(50), ma(150), ma(250)
+        rsi   = _calc_rsi(close)
+        stage = _stage(price, ma50, ma150, ma250, close)
+
+        perf_1w = _perf(close, 5)
+        perf_1m = _perf(close, 21)
+        perf_1y = _perf(close, 252)
+
+        n_rs     = min(63, len(close) - 1)
+        stock_3m = (price - float(close.iloc[-n_rs])) / float(close.iloc[-n_rs]) * 100
+        bench_3m = _bench_return(benchmark, n_rs)
+        rs_diff  = (stock_3m - bench_3m) if bench_3m is not None else None
+
+        pe_str = "N/A"
+        if ticker not in ETF_TICKERS:
+            try:
+                info      = t.info
+                pe        = info.get("trailingPE") or info.get("forwardPE")
+                sector    = info.get("sector", "")
+                sector_pe = SECTOR_PE.get(sector)
+                if pe and not pd.isna(pe):
+                    pe = round(float(pe), 1)
+                    if sector_pe:
+                        prem = (pe - sector_pe) / sector_pe * 100
+                        tag  = "up premium" if prem > 15 else ("dn discount" if prem < -15 else "fair")
+                        pe_str = f"{pe}x vs {sector_pe}x ({tag})"
+                    else:
+                        pe_str = f"{pe}x"
+            except Exception:
+                pass
+
+        ma_icons = []
+        for label, val in [("50d", ma50), ("150d", ma150), ("250d", ma250)]:
+            if val is None:    ma_icons.append(f"{label}:--")
+            elif price > val:  ma_icons.append(f"{label}OK")
+            else:              ma_icons.append(f"{label}X")
+
+        invested = qty * avg_buy
+        pct_buy  = (price - avg_buy) / avg_buy * 100
+        day_chg  = (price - prev) / prev * 100
+
+        return {
+            "ticker": ticker, "name": name, "sym": sym, "qty": qty,
+            "avg_buy": avg_buy, "invested": invested,
+            "price": price, "pct_buy": pct_buy, "day_chg": day_chg,
+            "ma50": ma50, "ma150": ma150, "ma250": ma250,
+            "ma_icons": "  ".join(ma_icons),
+            "stage": stage, "rsi": rsi, "rs_diff": rs_diff, "pe_str": pe_str,
+            "perf_1w": perf_1w, "perf_1m": perf_1m, "perf_1y": perf_1y,
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "name": name, "ticker": ticker, "sym": sym, "qty": qty,
+            "avg_buy": avg_buy, "invested": qty * avg_buy, "error": str(e)[:60],
+        }
+
+
+def analyse_bitcoin(qty_btc, invested_inr):
+    """Fetch BTC-USD + USDINR, compute all Bitcoin metrics."""
+    try:
+        hist_btc = yf.Ticker("BTC-USD").history(period="400d")
+        hist_fx  = yf.Ticker("USDINR=X").history(period="5d")
+
+        if hist_btc.empty:
+            return {"name": "Bitcoin", "error": "BTC data unavailable"}
+
+        close_usd = hist_btc["Close"].dropna()
+        price_usd = float(close_usd.iloc[-1])
+        usdinr    = float(hist_fx["Close"].iloc[-1]) if not hist_fx.empty else 84.0
+        price_inr = price_usd * usdinr
+
+        current_val_inr = price_inr * qty_btc
+        pct_buy = (current_val_inr - invested_inr) / invested_inr * 100
+
+        perf_1w = _perf(close_usd, 5)
+        perf_1m = _perf(close_usd, 21)
+        perf_1y = _perf(close_usd, 252)
+
+        rsi   = _calc_rsi(close_usd)
+        ma200 = float(close_usd.rolling(200).mean().iloc[-1]) if len(close_usd) >= 200 else None
+        above_ma200 = (price_usd > ma200) if ma200 is not None else None
+
+        daily_rets = close_usd.pct_change().dropna()
+        vol_30d = float(daily_rets.tail(30).std() * (252 ** 0.5) * 100) if len(daily_rets) >= 30 else None
+
+        fng_value, fng_label = None, "N/A"
+        try:
+            r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
+            d = r.json()["data"][0]
+            fng_value = int(d["value"])
+            fng_label = d["value_classification"]
+        except Exception:
+            pass
+
+        return {
+            "name": "Bitcoin", "ticker": "BTC-USD",
+            "qty_btc": qty_btc, "invested_inr": invested_inr,
+            "price_usd": price_usd, "price_inr": price_inr, "usdinr": usdinr,
+            "current_val_inr": current_val_inr, "pct_buy": pct_buy,
+            "rsi": rsi, "ma200": ma200, "above_ma200": above_ma200, "vol_30d": vol_30d,
+            "perf_1w": perf_1w, "perf_1m": perf_1m, "perf_1y": perf_1y,
+            "fng_value": fng_value, "fng_label": fng_label,
+            "error": None,
+        }
+    except Exception as e:
+        return {"name": "Bitcoin", "error": str(e)[:60]}
+
+
+def analyse_all():
+    _bench_return("^NSEI")
+    _bench_return("SPY")
+
+    tasks = (
+        [(t, n, q, b, s, "^NSEI") for t, n, q, b, s in INDIAN] +
+        [(t, n, q, b, s, "SPY")   for t, n, q, b, s in US]
+    )
+
+    results = []
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs = {ex.submit(analyse, *args): args for args in tasks}
+        for fut in as_completed(futs):
+            results.append(fut.result())
+
+    # Indian (INR) first then US (USD), within each group sort by invested descending
+    results.sort(key=lambda r: (0 if r.get("sym") == "INR" else 1, -r.get("invested", 0)))
+    return results
+
+
+# ============================================================
+# NEWS
+# ============================================================
+
+def get_news(tickers, max_items=7):
+    seen, items = set(), []
+    for ticker in tickers:
+        if len(items) >= max_items:
+            break
+        try:
+            news_list = yf.Ticker(ticker).news or []
+            for n in news_list[:2]:
+                if "content" in n:
+                    title = n["content"].get("title", "")
+                    link  = (n["content"].get("canonicalUrl") or {}).get("url", "")
+                    pub   = (n["content"].get("provider") or {}).get("displayName", "")
+                else:
+                    title = n.get("title", "")
+                    link  = n.get("link", "")
+                    pub   = n.get("publisher", "")
+                if title and link and title not in seen:
+                    seen.add(title)
+                    items.append({"title": title, "link": link, "publisher": pub})
+        except Exception:
+            continue
+    return items
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def _tg_row(r):
+    sym      = r["sym"]
+    price_f  = _pf(r["price"], sym)
+    inv_f    = _pf(r["invested"], sym)
+    rsi_s    = f"{r['rsi']:.0f}" if r.get("rsi") is not None else "N/A"
+    rs_s     = f"{r['rs_diff']:+.1f}%" if r.get("rs_diff") is not None else "N/A"
+    w1 = _pct(r["perf_1w"]) if r.get("perf_1w") is not None else "N/A"
+    m1 = _pct(r["perf_1m"]) if r.get("perf_1m") is not None else "N/A"
+    y1 = _pct(r["perf_1y"]) if r.get("perf_1y") is not None else "N/A"
+    return (
+        f"*{r['name']}*  {price_f}  {_pct(r['pct_buy'])} vs buy  Inv:{inv_f}\n"
+        f"   {r['ma_icons']}  RSI:{rsi_s}  RS:{rs_s}\n"
+        f"   1W:{w1}  1M:{m1}  1Y:{y1}  P/E:{r['pe_str']}"
+    )
+
+
+def build_telegram(results, gold_r, btc_r):
+    today = datetime.now().strftime("%d %b %Y")
+    msgs  = []
+
+    for label, sym_filter in [("India", "INR"), ("US", "USD")]:
+        flag = "\U0001f1ee\U0001f1f3" if sym_filter == "INR" else "\U0001f1fa\U0001f1f8"
+        recs = [r for r in results if r.get("sym") == sym_filter]
+        msg  = f"Portfolio Digest - {today}\n{flag} {label}\n"
+
+        for stage_val, hdr in [
+            (2, "\n-- UPTREND Stage 2 --"),
+            (1, "\n-- BASING  Stage 1 --"),
+            (3, "\n-- TOPPING Stage 3 --"),
+            (4, "\n-- DOWNTREND Stage 4 --"),
+        ]:
+            grp = [r for r in recs if not r.get("error") and r.get("stage") == stage_val]
+            if grp:
+                msg += f"\n{hdr}\n"
+                msg += "\n\n".join(_tg_row(r) for r in grp)
+
+        errs = [r for r in recs if r.get("error")]
+        if errs:
+            msg += "\n\nUnavailable: " + ", ".join(r["name"] for r in errs)
+
+        msgs.append(msg)
+
+    # Crypto section
+    crypto_msg = "Gold & Bitcoin\n"
+
+    if gold_r and not gold_r.get("error"):
+        g = gold_r
+        w1    = _pct(g["perf_1w"]) if g.get("perf_1w") is not None else "N/A"
+        m1    = _pct(g["perf_1m"]) if g.get("perf_1m") is not None else "N/A"
+        y1    = _pct(g["perf_1y"]) if g.get("perf_1y") is not None else "N/A"
+        rsi_s = f"{g['rsi']:.0f}" if g.get("rsi") is not None else "N/A"
+        crypto_msg += (
+            f"\nGold ETF (HDFC)  Rs{g['price']:,.2f}  {_pct(g['pct_buy'])} vs buy\n"
+            f"   Invested: Rs{g['invested']:,.0f}  ({g['qty']:.0f} units @ Rs{g['avg_buy']:.2f})\n"
+            f"   1W:{w1}  1M:{m1}  1Y:{y1}\n"
+            f"   {g['ma_icons']}  RSI:{rsi_s}"
+        )
+
+    if btc_r and not btc_r.get("error"):
+        b     = btc_r
+        w1    = _pct(b["perf_1w"]) if b.get("perf_1w") is not None else "N/A"
+        m1    = _pct(b["perf_1m"]) if b.get("perf_1m") is not None else "N/A"
+        y1    = _pct(b["perf_1y"]) if b.get("perf_1y") is not None else "N/A"
+        rsi_s = f"{b['rsi']:.0f}" if b.get("rsi") is not None else "N/A"
+        ma_s  = "Above 200MA (Bull)" if b.get("above_ma200") else "Below 200MA (Bear)"
+        vol_s = f"{b['vol_30d']:.0f}%" if b.get("vol_30d") is not None else "N/A"
+        fng_s = f"{b['fng_value']} ({b['fng_label']})" if b.get("fng_value") is not None else "N/A"
+        crypto_msg += (
+            f"\n\nBitcoin  Rs{b['price_inr']:,.0f}  (${b['price_usd']:,.0f})\n"
+            f"   {_pct(b['pct_buy'])} vs buy  |  Invested: Rs{b['invested_inr']:,.0f}  ({b['qty_btc']:.6f} BTC)\n"
+            f"   1W:{w1}  1M:{m1}  1Y:{y1}\n"
+            f"   {ma_s}  RSI:{rsi_s}  30D Vol:{vol_s}  Fear&Greed:{fng_s}"
+        )
+
+    msgs.append(crypto_msg)
+    return msgs
+
+
+def build_telegram_news(news_items):
+    lines = ["Market Pulse"]
+    for n in news_items:
+        pub = f" ({n['publisher']})" if n.get("publisher") else ""
+        lines.append(f"- {n['title']}{pub}\n  {n['link']}")
+    if not news_items:
+        lines.append("(no news fetched)")
+    lines += [
+        "",
+        "India News: https://news.google.com/search?q=India+NSE+stock+market+today",
+        "US News: https://news.google.com/search?q=US+stock+market+today",
+    ]
+    return "\n".join(lines)
+
+
+# ============================================================
+# EMAIL
+# ============================================================
+
+def _pct_span(v):
+    if v is None:
+        return "N/A"
+    col = "#1a7a3c" if v >= 0 else "#a31c1c"
+    return f"<span style='color:{col}'>{_pct(v)}</span>"
+
+
+def _ma_icon(label, price, val):
+    if val is None:       return f"<span style='color:#aaa'>{label}:--</span>"
+    if price > val:       return f"<span style='color:#1a7a3c'>{label}&#10003;</span>"
+    return f"<span style='color:#a31c1c'>{label}&#10007;</span>"
+
+
+def _email_row(r):
+    if r.get("error"):
+        return (
+            f"<tr><td colspan='10' style='color:#888;font-style:italic;padding:6px'>"
+            f"{r['name']}: {r['error']}</td></tr>"
+        )
+
+    bg      = _stage_bg(r["stage"])
+    sym     = r["sym"]
+    buy_col = "#1a7a3c" if r["pct_buy"] >= 0 else "#a31c1c"
+    day_col = "#1a7a3c" if r["day_chg"] >= 0 else "#a31c1c"
+
+    rsi = r.get("rsi")
+    rsi_str   = f"{rsi:.0f}" if rsi is not None else "N/A"
+    rsi_style = ""
+    if rsi is not None:
+        if rsi >= 70:   rsi_style = "color:#a31c1c;font-weight:bold"
+        elif rsi <= 30: rsi_style = "color:#1a7a3c;font-weight:bold"
+
+    rs     = r.get("rs_diff")
+    rs_str = f"{rs:+.1f}%" if rs is not None else "N/A"
+    rs_col = "#1a7a3c" if (rs is not None and rs > 0) else "#a31c1c"
+
+    inv_f = _pf(r["invested"], sym)
+    ma_html = " &nbsp; ".join([
+        _ma_icon("50d",  r["price"], r.get("ma50")),
+        _ma_icon("150d", r["price"], r.get("ma150")),
+        _ma_icon("250d", r["price"], r.get("ma250")),
+    ])
+    stage_emoji = {1:"&#9898;", 2:"&#128994;", 3:"&#128993;", 4:"&#128308;", 0:"&#9899;"}
+    action = _action(r["stage"], r["pct_buy"], rsi)
+
+    return f"""
+    <tr style="background:{bg}">
+      <td style="padding:6px 8px">
+        <b>{r['name']}</b><br>
+        <span style="color:#888;font-size:10px">{r['ticker']}</span><br>
+        <span style="color:#555;font-size:10px">{inv_f} &middot; {r['qty']:g} units</span>
+      </td>
+      <td style="padding:6px 8px">{_pf(r['price'], sym)}</td>
+      <td style="padding:6px 8px;color:{day_col}">{_pct(r['day_chg'])}</td>
+      <td style="padding:6px 8px;color:{buy_col};font-weight:bold">{_pct(r['pct_buy'])}</td>
+      <td style="padding:6px 8px;font-size:11px">{_pct_span(r.get('perf_1w'))} / {_pct_span(r.get('perf_1m'))} / {_pct_span(r.get('perf_1y'))}</td>
+      <td style="padding:6px 8px;font-size:11px">{ma_html}</td>
+      <td style="padding:6px 8px;{rsi_style}">{rsi_str}</td>
+      <td style="padding:6px 8px;color:{rs_col}">{rs_str}</td>
+      <td style="padding:6px 8px;font-size:10px">{r['pe_str']}</td>
+      <td style="padding:6px 8px;font-weight:bold">{stage_emoji.get(r['stage'],'')} {action}</td>
+    </tr>"""
+
+
+def _email_stage_section(title, title_color, recs, stage_filter):
+    grp = [r for r in recs if not r.get("error") and r.get("stage") == stage_filter]
+    if not grp:
+        return ""
+    rows = "".join(_email_row(r) for r in grp)
+    return f"""
+    <h3 style="color:{title_color};margin:20px 0 6px">{title}</h3>
+    <table border="1" cellpadding="0" cellspacing="0"
+           style="border-collapse:collapse;font-size:12px;width:100%;margin-bottom:8px">
+      <thead>
+        <tr style="background:#333;color:#fff;text-align:left">
+          <th style="padding:7px 8px">Stock (Invested &middot; Qty)</th>
+          <th style="padding:7px 8px">Price</th>
+          <th style="padding:7px 8px">Today</th>
+          <th style="padding:7px 8px">vs Buy</th>
+          <th style="padding:7px 8px">1W / 1M / 1Y</th>
+          <th style="padding:7px 8px">50 / 150 / 250d MA</th>
+          <th style="padding:7px 8px">RSI</th>
+          <th style="padding:7px 8px">RS vs Index</th>
+          <th style="padding:7px 8px">P/E vs Sector</th>
+          <th style="padding:7px 8px">Signal</th>
+        </tr>
+      </thead>
+      <tbody>{rows}</tbody>
+    </table>"""
+
+
+def _market_block(label, recs):
+    return (
+        f"<h2 style='border-bottom:2px solid #333;padding-bottom:6px'>{label}</h2>" +
+        _email_stage_section("&#128994; Uptrend &mdash; Stage 2",   "#1a7a3c", recs, 2) +
+        _email_stage_section("&#9898; Basing  &mdash; Stage 1",     "#495057", recs, 1) +
+        _email_stage_section("&#128993; Topping &mdash; Stage 3",   "#856404", recs, 3) +
+        _email_stage_section("&#128308; Downtrend &mdash; Stage 4", "#a31c1c", recs, 4)
+    )
+
+
+def _crypto_section_html(gold_r, btc_r):
+    html = "<h2 style='border-bottom:2px solid #333;padding-bottom:6px;margin-top:28px'>&#128176; Gold &amp; Bitcoin</h2>"
+
+    # Gold ETF
+    if gold_r and not gold_r.get("error"):
+        g = gold_r
+        buy_col = "#1a7a3c" if g["pct_buy"] >= 0 else "#a31c1c"
+        rsi_str = f"{g['rsi']:.0f}" if g.get("rsi") is not None else "N/A"
+        ma_html = " &nbsp; ".join([
+            _ma_icon("50d",  g["price"], g.get("ma50")),
+            _ma_icon("150d", g["price"], g.get("ma150")),
+            _ma_icon("250d", g["price"], g.get("ma250")),
+        ])
+        html += f"""
+        <h3 style="color:#B8860B;margin:16px 0 6px">Gold ETF (HDFC) &mdash; GOLDIETF.NS</h3>
+        <table border="1" cellpadding="0" cellspacing="0"
+               style="border-collapse:collapse;font-size:12px;width:70%;margin-bottom:16px">
+          <thead>
+            <tr style="background:#333;color:#fff;text-align:left">
+              <th style="padding:7px 8px">Price</th>
+              <th style="padding:7px 8px">Invested (Qty)</th>
+              <th style="padding:7px 8px">vs Buy</th>
+              <th style="padding:7px 8px">1W / 1M / 1Y</th>
+              <th style="padding:7px 8px">50 / 150 / 250d MA</th>
+              <th style="padding:7px 8px">RSI</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="background:#fffde7">
+              <td style="padding:6px 8px">&#8377;{g['price']:,.2f}</td>
+              <td style="padding:6px 8px">&#8377;{g['invested']:,.0f} ({g['qty']:.0f} units @ &#8377;{g['avg_buy']:.2f})</td>
+              <td style="padding:6px 8px;color:{buy_col};font-weight:bold">{_pct(g['pct_buy'])}</td>
+              <td style="padding:6px 8px">{_pct_span(g.get('perf_1w'))} / {_pct_span(g.get('perf_1m'))} / {_pct_span(g.get('perf_1y'))}</td>
+              <td style="padding:6px 8px;font-size:11px">{ma_html}</td>
+              <td style="padding:6px 8px">{rsi_str}</td>
+            </tr>
+          </tbody>
+        </table>"""
+
+    # Bitcoin
+    if btc_r and not btc_r.get("error"):
+        b = btc_r
+        buy_col = "#1a7a3c" if b["pct_buy"] >= 0 else "#a31c1c"
+        rsi_str = f"{b['rsi']:.0f}" if b.get("rsi") is not None else "N/A"
+        ma_s    = "&#128994; Above 200MA (Bull)" if b.get("above_ma200") else "&#128308; Below 200MA (Bear)"
+        vol_s   = f"{b['vol_30d']:.0f}%" if b.get("vol_30d") is not None else "N/A"
+        fng_s   = f"{b['fng_value']} &mdash; {b['fng_label']}" if b.get("fng_value") is not None else "N/A"
+        html += f"""
+        <h3 style="color:#F7931A;margin:16px 0 6px">Bitcoin (BTC)</h3>
+        <table border="1" cellpadding="0" cellspacing="0"
+               style="border-collapse:collapse;font-size:12px;width:95%;margin-bottom:16px">
+          <thead>
+            <tr style="background:#333;color:#fff;text-align:left">
+              <th style="padding:7px 8px">Price (INR)</th>
+              <th style="padding:7px 8px">Price (USD)</th>
+              <th style="padding:7px 8px">USD/INR</th>
+              <th style="padding:7px 8px">Invested</th>
+              <th style="padding:7px 8px">vs Buy</th>
+              <th style="padding:7px 8px">1W / 1M / 1Y</th>
+              <th style="padding:7px 8px">200d MA</th>
+              <th style="padding:7px 8px">RSI</th>
+              <th style="padding:7px 8px">30D Volatility</th>
+              <th style="padding:7px 8px">Fear &amp; Greed</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="background:#fff8f0">
+              <td style="padding:6px 8px">&#8377;{b['price_inr']:,.0f}</td>
+              <td style="padding:6px 8px">${b['price_usd']:,.0f}</td>
+              <td style="padding:6px 8px">{b['usdinr']:.1f}</td>
+              <td style="padding:6px 8px">&#8377;{b['invested_inr']:,.0f} ({b['qty_btc']:.6f} BTC)</td>
+              <td style="padding:6px 8px;color:{buy_col};font-weight:bold">{_pct(b['pct_buy'])}</td>
+              <td style="padding:6px 8px">{_pct_span(b.get('perf_1w'))} / {_pct_span(b.get('perf_1m'))} / {_pct_span(b.get('perf_1y'))}</td>
+              <td style="padding:6px 8px">{ma_s}</td>
+              <td style="padding:6px 8px">{rsi_str}</td>
+              <td style="padding:6px 8px">{vol_s}</td>
+              <td style="padding:6px 8px">{fng_s}</td>
+            </tr>
+          </tbody>
+        </table>"""
+
+    return html
+
+
+def build_email_html(results, gold_r, btc_r, news_items):
+    today = datetime.now().strftime("%d %b %Y, %A")
+    india = [r for r in results if r.get("sym") == "INR"]
+    us    = [r for r in results if r.get("sym") == "USD"]
+
+    errs     = [r for r in results if r.get("error")]
+    err_html = ""
+    if errs:
+        err_html = (
+            "<p style='color:#888;font-size:12px'>Unavailable: " +
+            ", ".join(r["name"] for r in errs) + "</p>"
+        )
+
+    news_html = "<h2 style='border-bottom:2px solid #333;padding-bottom:6px;margin-top:28px'>&#128240; Market Pulse</h2>"
+    if news_items:
+        news_html += "<ul style='font-size:13px;line-height:1.9;margin-top:10px'>"
+        for n in news_items:
+            pub = f" <span style='color:#888'>&mdash; {n['publisher']}</span>" if n.get("publisher") else ""
+            news_html += f"<li><a href='{n['link']}'>{n['title']}</a>{pub}</li>"
+        news_html += "</ul>"
+    news_html += """
+    <div style="margin-top:12px;font-size:12px;line-height:2.4">
+      &#128269; <a href="https://news.google.com/search?q=India+NSE+stock+market+today">India Market News</a> &nbsp;|&nbsp;
+      &#128269; <a href="https://news.google.com/search?q=US+stock+market+today">US Market News</a><br>
+      &#128241; <a href="https://reddit.com/r/IndiaInvestments/">r/IndiaInvestments</a> &nbsp;|&nbsp;
+      &#128241; <a href="https://reddit.com/r/stocks/">r/stocks</a><br>
+      &#9654; <a href="https://youtube.com/results?search_query=India+stock+market+analysis+today">India YouTube</a> &nbsp;|&nbsp;
+      &#9654; <a href="https://youtube.com/results?search_query=US+stock+market+analysis+today">US YouTube</a>
+    </div>"""
+
+    return f"""<!DOCTYPE html>
+<html>
+<body style="font-family:Arial,sans-serif;padding:20px;max-width:1600px;margin:0 auto;color:#222">
+
+<h1 style="margin-bottom:4px">&#128202; Portfolio Digest &mdash; {today}</h1>
+<p style="color:#888;font-size:12px;margin-bottom:22px">
+  Generated {datetime.now().strftime("%H:%M")} IST &nbsp;&middot;&nbsp;
+  Data: Yahoo Finance &nbsp;&middot;&nbsp; Not financial advice
+</p>
+
+{_market_block("&#127470;&#127475; Indian Holdings", india)}
+{_market_block("&#127482;&#127480; US Holdings", us)}
+
+{_crypto_section_html(gold_r, btc_r)}
+
+{err_html}
+{news_html}
+
+<hr style="margin-top:24px;border:none;border-top:1px solid #ddd">
+<p style="font-size:11px;color:#aaa;line-height:1.9">
+  Stage 2 &#128994; uptrend &middot; Stage 4 &#128308; downtrend &middot;
+  Stage 1 &#9898; basing &middot; Stage 3 &#128993; topping<br>
+  RSI &lt;30 oversold &middot; RSI &gt;70 overbought &middot;
+  RS = 3-month stock return vs index<br>
+  Stocks sorted by invested amount (descending) within each stage group.<br>
+  Bitcoin: 200d MA, 30d annualised volatility, Fear &amp; Greed from alternative.me
+</p>
+
+</body>
+</html>"""
+
+
+# ============================================================
+# SEND
+# ============================================================
+
+def send_telegram(text):
+    url    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+    for chunk in chunks:
+        r = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk,
+            "disable_web_page_preview": True,
+        }, timeout=15)
+        if r.status_code != 200:
+            print(f"  [!] Telegram error: {r.text[:120]}")
+        else:
+            print("  [ok] Telegram chunk sent")
+
+
+def send_email(html_body, subject):
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = GMAIL_ADDRESS
+    msg["To"]      = ", ".join(EMAIL_TO)
+    msg.attach(MIMEText(html_body, "html"))
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
+        s.login(GMAIL_ADDRESS, GMAIL_APP_PASS)
+        s.sendmail(GMAIL_ADDRESS, EMAIL_TO, msg.as_string())
+    print(f"  [ok] Email sent -> {', '.join(EMAIL_TO)}")
+
+
+def get_chat_id():
+    url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    data = requests.get(url, timeout=10).json()
+    recs = data.get("result", [])
+    if not recs:
+        print("No messages found. Open Telegram, message your bot, then re-run.")
+        return
+    for u in recs:
+        chat = u.get("message", {}).get("chat", {})
+        print(f"Chat ID: {chat.get('id')}")
+        break
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    if "--chat-id" in sys.argv:
+        get_chat_id()
+        return
+
+    if "--test" in sys.argv:
+        send_telegram(
+            "Portfolio Agent v3 is live! "
+            "RSI | RS | P/E | 1W/1M/1Y | Gold & Bitcoin | Sorted by invested."
+        )
+        return
+
+    today     = datetime.now()
+    today_str = today.strftime("%d %b %Y")
+    print(f"\nRunning portfolio digest v3 -- {today_str}")
+
+    # Monthly reminder on the 1st of every month
+    if today.day == 1:
+        reminder = (
+            "Monthly Reminder - Portfolio Update Needed\n\n"
+            "It's the 1st of the month. Please upload your latest:\n"
+            "- Kite holdings report: Kite app > Holdings > Export (top-right)\n"
+            "- IndMoney US holdings report: IndMoney > US Stocks > Export\n\n"
+            "Share the files in Cowork and quantities + avg buy prices will be updated."
+        )
+        send_telegram(reminder)
+
+    print(f"   Fetching {len(INDIAN) + len(US)} stocks in parallel...")
+    results = analyse_all()
+
+    ok  = [r for r in results if not r.get("error")]
+    err = [r for r in results if r.get("error")]
+    print(f"   {len(ok)} stocks analysed  {len(err)} unavailable")
+
+    print("   Fetching Gold ETF data...")
+    gold_r = analyse(GOLD[0], GOLD[1], GOLD[2], GOLD[3], GOLD[4], "^NSEI")
+
+    print("   Fetching Bitcoin data...")
+    btc_r = analyse_bitcoin(BITCOIN["qty_btc"], BITCOIN["invested_inr"])
+
+    print("   Fetching news...")
+    priority = [r["ticker"] for r in results if not r.get("error") and r.get("stage") in (3, 4)]
+    other    = [r["ticker"] for r in results if not r.get("error") and r.get("stage") not in (3, 4)]
+    news = get_news(priority + other)
+
+    print("\nSending Telegram messages...")
+    for msg in build_telegram(results, gold_r, btc_r):
+        send_telegram(msg)
+    send_telegram(build_telegram_news(news))
+
+    print("\nSending email...")
+    html = build_email_html(results, gold_r, btc_r, news)
+    send_email(html, f"Portfolio Digest -- {today_str}")
+
+    print("\nDone.\n")
+
+
+if __name__ == "__main__":
+    main()
